@@ -1,0 +1,101 @@
+{
+  "name": "attention",
+  "seed": 0,
+  "device": "auto",
+  "out_dir": "runs_carracing",
+  "memory_budget_mb": 9500,
+  "env": {
+    "id": "CarRacing-v0",
+    "kwargs": {},
+    "image_size": 64,
+    "max_episode_steps": 250,
+    "action_repeat": 2
+  },
+  "data": {
+    "root": "runs/data",
+    "n_rollouts": 150,
+    "steps_per_rollout": 250,
+    "shard_size": 50,
+    "policy": "random",
+    "val_fraction": 0.15,
+    "frames_in_ram": 40000,
+    "sequence_length": 64,
+    "eval_sequence_length": 200
+  },
+  "vision": {
+    "latent_dim": 32,
+    "channels": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "beta": 1.0,
+    "free_bits": 0.5,
+    "recon_loss": "l2_sum",
+    "checkpoint": "runs/data/CarRacing-v0_n150_t250_prandom_s0/vae_z32_s0.pt",
+    "epochs": 10,
+    "batch_size": 128,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "grad_clip": 5.0
+  },
+  "memory": {
+    "backbone": "attention",
+    "backbone_kwargs": {},
+    "hidden_dim": 256,
+    "n_mixtures": 5,
+    "predict_reward": true,
+    "predict_done": true,
+    "temperature": 1.15,
+    "epochs": 12,
+    "batch_size": 16,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "reward_loss_weight": 1.0,
+    "done_loss_weight": 1.0,
+    "critical_loss_weight": 1.0,
+    "param_match": true,
+    "param_match_tol": 0.1
+  },
+  "controller": {
+    "hidden_input": true,
+    "algo": "cma",
+    "population": 32,
+    "generations": 25,
+    "sigma_init": 0.5,
+    "episodes_per_candidate": 3,
+    "eval_episodes": 12,
+    "n_workers": 6,
+    "train_in_dream": false,
+    "dream_horizon": 300
+  },
+  "bench": {
+    "horizons": [
+      1,
+      2,
+      5,
+      10,
+      20,
+      50,
+      100
+    ],
+    "probe_delays": [
+      1,
+      5,
+      10,
+      25,
+      50
+    ],
+    "n_eval_sequences": 256,
+    "continual_tasks": 4,
+    "continual_epochs_per_task": 4,
+    "latency_batch": 1,
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  }
+}

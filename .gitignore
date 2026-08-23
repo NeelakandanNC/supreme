@@ -1,0 +1,34 @@
+# Virtualenv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Large binaries: regenerable from the code, and too big for a git repo.
+# The frame store alone is ~2.8 GB.
+**/runs/data/
+*.npy
+*.npz
+*.pt
+
+# Raw logs (multi-MB, superseded by metrics.jsonl and REPORT.md)
+*.log
+
+# Source papers.
+# world_model.pdf and nested_learning.pdf are third-party copyrighted works
+# (arXiv:1803.10122 and arXiv:2512.24695). This repository is public, so they
+# are NOT redistributed here -- download them from arXiv. Remove these two lines
+# and `git add -f` if you have established you have the right to republish them.
+world_model.pdf
+nested_learning.pdf
+
+# LaTeX build products
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+
+# macOS
+.DS_Store

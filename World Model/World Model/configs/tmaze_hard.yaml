@@ -1,0 +1,39 @@
+# Harder operating point: corridor 32.
+#
+# At corridor 16 (configs/tmaze.yaml) the benchmark saturates -- GRU, `supreme`
+# and `supreme-titans` all reach decision accuracy 1.0 and return 1.0, so the
+# result cannot separate them. This config exists to find where they come apart.
+_base_: base.yaml
+
+name: baseline
+env:
+  id: TMaze-v0
+  max_episode_steps: 37
+  kwargs:
+    corridor_length: 32
+    n_cues: 2
+    distractors: 3
+    cue_steps: 2
+    feedback_steps: 2
+
+data:
+  n_rollouts: 1200
+  steps_per_rollout: 37
+  val_fraction: 0.15
+  sequence_length: 37          # MUST span cue -> decision
+  eval_sequence_length: 37
+  frames_in_ram: 60000
+
+memory:
+  critical_loss_weight: 20
+  epochs: 60
+  batch_size: 64
+
+controller:
+  episodes_per_candidate: 16
+  generations: 60
+  population: 32
+
+bench:
+  horizons: [1, 2, 4, 8, 16, 24]
+  probe_delays: [0, 1, 2, 4, 8, 16, 24, 32]

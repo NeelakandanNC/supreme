@@ -1,0 +1,18 @@
+# Virtualenv / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Large, regenerable run artefacts.
+# The evidence a reviewer needs -- bench.json, metrics.jsonl, config.json,
+# REPORT.md and the figures -- IS committed. What is excluded is only the bulk:
+# the frame store (~2.8 GB), the precomputed latents, and model checkpoints.
+runs*/data/
+*.pt
+*.npy
+*.npz
+
+# Raw stdout logs (multi-MB; superseded by metrics.jsonl and REPORT.md)
+*.log
+runs_finish.DONE

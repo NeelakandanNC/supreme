@@ -1,0 +1,13 @@
+# Core (required)
+torch>=2.3            # MPS backend for Apple silicon
+numpy>=1.26
+pyyaml>=6.0
+pillow>=10.0          # frame resize + reconstruction grids
+
+# Recommended
+cma>=3.3              # CMA-ES for the controller (a pure-numpy ES fallback ships in wmcore)
+matplotlib>=3.8       # benchmark figures
+
+# Optional: only needed for the CarRacing reference environment.
+# Install separately, it pulls a source build of Box2D on Apple silicon:
+#   pip install swig && pip install 'gymnasium[box2d]'

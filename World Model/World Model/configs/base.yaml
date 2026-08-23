@@ -1,0 +1,64 @@
+# Shared defaults for every experiment in the study.
+# Concrete configs inherit with `_base_: base.yaml` and override a few keys.
+#
+# Sizing note: every default here is chosen for an Apple M4 with 16 GB of
+# unified memory, assuming ~10 GB is actually available. The two numbers that
+# control the memory footprint are data.n_rollouts x data.steps_per_rollout
+# (disk, memory-mapped) and memory.batch_size x data.sequence_length (RAM).
+
+name: baseline
+seed: 0
+device: auto
+out_dir: runs
+memory_budget_mb: 9500
+
+env:
+  id: TMaze-v0
+  image_size: 64
+  action_repeat: 1
+
+data:
+  root: runs/data
+  policy: random
+  val_fraction: 0.1
+  frames_in_ram: 60000
+
+vision:
+  latent_dim: 32
+  channels: [32, 64, 128, 256]
+  beta: 1.0
+  free_bits: 0.5
+  epochs: 12
+  batch_size: 128
+  lr: 1.0e-3
+  grad_clip: 5.0
+
+memory:
+  backbone: lstm          # <-- THE ONLY KEY THAT DIFFERS BETWEEN THE TWO MODELS
+  backbone_kwargs: {}
+  hidden_dim: 256
+  n_mixtures: 5
+  predict_reward: true
+  predict_done: true
+  temperature: 1.0
+  epochs: 20
+  batch_size: 32
+  lr: 1.0e-3
+  grad_clip: 1.0
+
+controller:
+  hidden_input: true
+  algo: cma
+  population: 32
+  generations: 40
+  sigma_init: 0.5
+  episodes_per_candidate: 4
+  eval_episodes: 16
+  n_workers: 6
+  train_in_dream: false
+
+bench:
+  n_eval_sequences: 256
+  continual_tasks: 4
+  continual_epochs_per_task: 4
+  seeds: [0, 1, 2]

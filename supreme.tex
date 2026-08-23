@@ -1,0 +1,844 @@
+% =====================================================================
+%  Supreme: swapping the memory of a world model
+%  Build:  pdflatex supreme.tex   (twice, for references)
+%  No external .bib -- references are inlined.
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,
+            citecolor=blue!50!black]{hyperref}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{listings}
+
+\lstset{basicstyle=\ttfamily\footnotesize,frame=single,breaklines=true,
+        columns=flexible,showstringspaces=false,xleftmargin=1em}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\WM}{\textsc{World Model}}
+\newcommand{\SUP}{\textsc{Supreme}}
+\newcommand{\todo}[1]{\textcolor{red}{[#1]}}
+
+\title{\SUP: Isolating the Memory Layer of a World Model\\
+       \large An apples-to-apples comparison of the MDN-RNN and a
+       nested-learning memory, at laptop scale}
+\author{ Kuppala Sarath Narendra , Neelakandan NC}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We build a world model in the sense of Ha and Schmidhuber
+\cite{ha2018world}---a visual encoder $V$, a memory $M$, and a controller
+$C$---and replace \emph{only} the recurrent core of $M$ with the memory
+mechanism proposed by Behrouz et al.\ under the nested-learning framework
+\cite{behrouz2025nested}, specifically the \textsc{Hope} module: a
+self-modifying Titans block followed by a Continuum Memory System. Every other
+component---the environments, the data pipeline, the convolutional VAE, the
+mixture-density output head, the loss, the optimiser, the controller, and the
+entire evaluation suite---is literally the same code in both arms, so the
+comparison has exactly one axis of variation. Because the only thing that
+differs is the memory, we evaluate with memory benchmarks: cue retention as a
+function of delay, prediction accuracy at the one transition per episode that
+requires memory, open-loop imagination divergence, and end-to-end control.
+
+At a 32-step required memory horizon \textsc{Hope} solves the task outright
+(decision accuracy $1.000$, real-environment return $1.00$) while the MDN-RNN and
+a GRU control both sit at chance, and a linear probe locates the difference
+precisely: \textsc{Hope}'s state still encodes the cue at delay 32, the GRU's has
+decayed to chance, the LSTM's is gone by delay 8. Two ablations sharpen the
+claim rather than support it. Attaching the Continuum Memory System to the
+baseline LSTM changes nothing at all, so the advantage lies entirely in the
+sequence mixer; and replacing the self-modifying block with softmax attention
+also solves the task, so self-modification is not uniquely necessary for
+retention. What distinguishes the two is imagination: attention retains
+perfectly yet its open-loop rollout diverges ($44.6$ MSE at horizon 16 against
+$0.51$), while \textsc{Hope} both retains and stays on trajectory at a
+fixed-size state. We also quantify a property of the objective itself---
+maximum-likelihood world-model training rewards retaining a task-critical cue by
+only ${\sim}0.7$ nats out of ${\sim}25$, so at the standard weighting every
+memory layer we tested scores at chance. The entire study---data collection,
+training, evolutionary search and evaluation---runs on a single Apple M4 laptop
+with 16\,GB of unified memory.
+\end{abstract}
+
+\tableofcontents
+
+% =====================================================================
+\section{Motivation and scope}
+
+The claim under test is narrow and should stay narrow:
+
+\begin{quote}
+Swapping the recurrent core of a world model's memory module for a
+nested-learning memory changes how much the world model remembers.
+\end{quote}
+
+\noindent The answer turns out to be yes, but for a narrower reason than the
+framing suggests, and \S\ref{sec:ablation} is where that narrowing happens.
+
+Two consequences follow immediately, and they shape everything below.
+
+\paragraph{One axis of variation, enforced by code layout.} The obvious
+implementation---a self-contained copy of the pipeline per model---cannot
+support this claim. With two copies of the data loader, the VAE, the loss and
+the controller, the two arms drift, and every reported difference becomes ``the
+memory layer, plus whatever else diverged''; no diff of two sixty-file trees
+tells you which. We therefore keep a single shared core and reduce each model to
+one small folder containing its recurrent core and nothing else
+(\S\ref{sec:layout}). A model folder \emph{cannot} change the training loop
+because it contains no training loop.
+
+\paragraph{Memory benchmarks, not control benchmarks.} If the memory is the only
+difference, then a benchmark that does not stress memory cannot resolve the
+question. We show in \S\ref{sec:findings-nll} that the standard world-model
+metric---one-step negative log-likelihood---separates an LSTM core from a GRU
+core by $0.01$ nats while their effective memory horizons differ threefold. Our
+primary instruments are therefore probes of the recurrent state and prediction
+accuracy restricted to memory-critical transitions.
+
+% =====================================================================
+\section{The two models}
+\label{sec:models}
+
+Both models have the three-part structure of \cite{ha2018world}:
+\begin{equation}
+\text{obs}_t \;\xrightarrow{\;V\;}\; z_t
+\qquad
+a_t = C\!\left([z_t\,;h_t]\right)
+\qquad
+h_{t+1} = M(z_t, a_t, h_t).
+\end{equation}
+$V$ compresses a frame to a latent, $M$ predicts the next latent, and $C$ maps
+the pair to an action.
+
+\subsection{Shared components}
+
+These are identical---the same objects, not merely the same hyperparameters---in
+both arms.
+
+\paragraph{$V$: convolutional VAE.} A faithful reimplementation of
+\cite[\S2.1]{ha2018world}: four strided convolutions with channel widths
+$(32,64,128,256)$ to a $1024$-d bottleneck, a diagonal Gaussian latent of $32$
+dimensions, and a mirrored deconvolutional decoder producing $64\times64\times3$
+frames. This is $4{,}348{,}547$ parameters, matching the count reported in their
+appendix. The objective is squared reconstruction error plus a KL term with a
+per-dimension floor (free bits, $0.5$ nats). The floor matters here: the
+synthetic memory environments contain very low-entropy frames, and an
+unconstrained KL collapses most latent dimensions to the prior, which would
+render the cue unrecoverable from $z$ and cripple \emph{both} memory models.
+
+$V$ is trained once per environment and then \emph{frozen}; latents are
+precomputed once and both arms consume the same \code{latents.npz}. Retraining
+$V$ per model would let VAE seed noise leak into the memory comparison, and that
+noise is larger than the effect being measured. It also makes the study
+affordable: after $V$ is frozen, training $M$ touches a ${\sim}30$\,MB array of
+32-d vectors rather than a multi-gigabyte frame store.
+
+\paragraph{Output head: mixture density network.} $M$ is a backbone plus a
+\emph{shared} head. The head is a diagonal MDN with $K=5$ components per latent
+dimension, exactly as in \cite[\S2.2]{ha2018world}, with optional scalar reward
+and termination heads. Writing $\pi,\mu,\sigma$ for the head's outputs, the
+per-step loss is
+\begin{equation}
+\mathcal{L}_t \;=\; -\sum_{d=1}^{32}\log \sum_{k=1}^{5}
+   \pi_{t,d,k}\,\mathcal{N}\!\left(z_{t+1,d};\,\mu_{t,d,k},\,\sigma_{t,d,k}\right).
+\label{eq:mdn}
+\end{equation}
+Sharing the head is not a convenience. If one arm had an MDN head and the other
+a Gaussian head, a difference in likelihood would confound \emph{what the model
+remembers} with \emph{how it expresses uncertainty}, and no ablation could
+separate them. Fixing the head makes a likelihood difference attributable to the
+recurrent core by construction.
+
+\paragraph{$C$: linear controller.} A single affine map from $[z_t;h_t]$ to an
+action, trained by CMA-ES \cite{hansen2006cma} (with a dependency-free
+Gaussian-ES fallback). Ha and Schmidhuber keep $C$ trivial so that competence
+must live in $V$ and $M$; here the argument does double duty. Because $C$ is
+linear and identical in both arms, a difference in return is a difference in how
+much task-relevant information the memory state exposes \emph{linearly}---which
+is precisely what our probes measure. Setting \code{controller.hidden\_input =
+false} gives the no-memory ablation in which $C$ sees $z_t$ only.
+
+\subsection{Model A --- \WM{} (baseline)}
+
+The control condition is the recurrent half of the MDN-RNN
+\cite[\S2.2]{ha2018world}: a single-layer LSTM with $256$ hidden units consuming
+$[z_t;a_t]$, whose output feeds the shared MDN head. Nothing else. With a 32-d
+latent and a 2-d one-hot action this is $299{,}008$ backbone parameters and
+$422{,}882$ for the full $M$.
+
+\subsection{Model B --- \SUP{} (\textsc{Hope})}
+
+The challenger is the \textsc{Hope} module of \cite[\S8.3]{behrouz2025nested}: a
+self-modifying Titans block whose output passes through a Continuum Memory
+System chain.
+
+\paragraph{Self-modifying Titans (\cite[\S8.1--8.2]{behrouz2025nested}, Eqs.\
+86--93).} Rather than projecting the input to keys, values and queries with
+weights frozen after pre-training, every projection is itself an associative
+memory that keeps learning during the sequence, and---the self-modifying
+part---each memory generates its own regression targets:
+\begin{align}
+q_t &= x_t W_q, &
+k_t &= \mathcal{M}_{k,t-1}(x_t), &
+v_t &= \mathcal{M}_{v,t-1}(x_t), \\
+\eta_t &= \mathcal{M}_{\eta,t-1}(x_t), &
+\alpha_t &= \mathcal{M}_{\alpha,t-1}(x_t), &
+\hat v_{\square,t} &= \mathcal{M}_{\square,t-1}(v_t), \\
+\mathcal{M}_{\square,t} &= \mathcal{M}_{\square,t-1}
+   \left(\alpha_t I - \eta_t k_t k_t^{\!\top}\right)
+   - \eta_t \nabla \mathcal{L}\!\left(\mathcal{M}_{\square,t-1};k_t,\hat v_{\square,t}\right),
+   & o_t &= \mathcal{M}_{\mathrm{mem},t-1}(q_t)
+\label{eq:titans}
+\end{align}
+for $\square\in\{k,v,\eta,\alpha,\mathrm{mem}\}$, with $\mathcal{L}$ the $L_2$
+regression loss, $\eta_t$ a data-dependent inner learning rate and $\alpha_t$ a
+data-dependent retention gate. The initial states $\mathcal{M}_{\square,0}$ are
+ordinary trainable parameters, meta-learned across sequences. We use the
+matrix-valued memories for which \cite[Eq.~93]{behrouz2025nested} derives the
+closed form, retaining the residual retrieval structure of their Eq.~89
+($\mathcal{M}(x) = x + Mx$), so the inner gradient is exact without invoking
+autograd inside the recurrence. Following \cite[\S8.3]{behrouz2025nested} we
+$L_2$-normalise $q$ and $k$ and apply a depthwise causal convolution of window~4.
+
+The chunked schedule of \cite[\S8.2]{behrouz2025nested} is implemented
+faithfully rather than as an optimisation: keys, values, gates, generated
+targets and inner gradients are all computed from the memory state at the
+\emph{start} of the chunk, which changes what the block computes.
+\code{chunk\_size = 1} recovers the fully online form.
+
+\paragraph{Continuum Memory System (\cite[\S7.1]{behrouz2025nested}, Eqs.\
+70--71).} A chain of MLP blocks in which level $\ell$ is updated only every
+$C^{(\ell)}$ steps, from the gradient accumulated over that window:
+\begin{equation}
+y_t = \mathrm{MLP}^{(f_k)}\!\left(\cdots \mathrm{MLP}^{(f_1)}(o_t)\right),
+\qquad
+\theta^{(f_\ell)}_{i+1} =
+\begin{cases}
+\theta^{(f_\ell)}_i - \sum_{t=i-C^{(\ell)}}^{i}\eta\,\nabla\mathcal{L}(\theta_t;x_t)
+   & i \equiv 0 \ (\mathrm{mod}\ C^{(\ell)}),\\[2pt]
+\theta^{(f_\ell)}_i & \text{otherwise.}
+\end{cases}
+\label{eq:cms}
+\end{equation}
+The argument is that when a fast level is overwritten by new data, the knowledge
+it held survives in the slower levels, so the system forgets reluctantly. We use
+periods $(1,4,16)$ and the sequential variant of their Eq.~73.
+
+\paragraph{Composition.} $\textsc{Hope} = \text{Titans} \rightarrow \text{CMS}$,
+their Eqs.~94--97. Because \textsc{Hope} \emph{is} the composition of two
+separable mechanisms, we implement them as independently switchable parts, which
+yields the ablation table for free (\S\ref{sec:variants}).
+
+\subsection{Controls and ablations}
+\label{sec:variants}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llr}
+\toprule
+Key & Composition & Backbone params \\
+\midrule
+\code{lstm}           & LSTM(256) --- the MDN-RNN core \cite{ha2018world} & $299{,}008$ \\
+\code{gru}            & GRU(256) --- gated-RNN control & $224{,}256$ \\
+\code{attention}      & causal self-attention --- ``perfect memory'' control & $299{,}058$ \\
+\midrule
+\code{supreme}        & Titans $\rightarrow$ CMS (\textsc{Hope}) & $300{,}696$ \\
+\code{supreme-titans} & Titans only & $224{,}520$ \\
+\code{supreme-cms}    & LSTM $\rightarrow$ CMS & $375{,}184$ \\
+\code{hope-attention} & attention $\rightarrow$ CMS (their \textsc{Hope-Attention}) & $375{,}234$ \\
+\bottomrule
+\end{tabular}
+\caption{The seven memory cores. Only \code{supreme} is parameter-matched to the
+baseline, and only it needs to be---it is the model making the claim.
+\code{supreme-titans} and \code{supreme-cms} are a strict subset and a strict
+superset of it by construction, so their counts are reported rather than
+equalised.}
+\label{tab:backbones}
+\end{table}
+
+The attention control deserves comment. Behrouz et al.\ characterise softmax
+attention as a ``perfect memory'': a non-parametric solution that caches every
+past token and never compresses \cite[\S8]{behrouz2025nested}. It is therefore
+the strongest available retention baseline, and a memory paper comparing only
+against recurrent cores leaves the obvious question unanswered. The interesting
+comparison is not who retains more---attention retains everything by
+construction---but at what price: attention's state grows linearly with the
+episode and its compute quadratically, while a fast-weight core keeps a
+fixed-size state.
+
+\subsection{What differs, and what cannot}
+\label{sec:layout}
+
+\begin{lstlisting}
+World Model/          MODEL 1: lstm_backbone.py, attention_backbone.py
+Supreme/              MODEL 2: titans.py, cms.py, hope.py
+wmcore/               SHARED: envs, data, V, MDN head, loss, C, dream, benchmarks
+\end{lstlisting}
+
+Model folders are discovered by path rather than by import name, which is why one
+can be called \code{World Model} despite the space. A machine check,
+\code{assert\_comparable}, diffs two run configurations and aborts unless the only
+differing keys are the backbone identifier and its keyword arguments; it runs
+before training in every study.
+
+\subsection{Deviations from the source papers}
+\label{sec:deviations}
+
+Recorded in full because each is a place where a reproduction could legitimately
+differ.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Is $q$ produced by a memory?} \cite[Eq.~94]{behrouz2025nested}
+lists a memory for $q$, while the surrounding text states that $q_t=x_tW_q$ is
+``the only non-adaptive projection''. We follow the text.
+
+\item \textbf{What is $\mathcal{L}$ in Eq.~71?} The equation states it is ``the
+objective of choice for the task at hand'', i.e.\ the \emph{outer} task loss.
+Read literally, Eq.~71 therefore describes a gradient-accumulation schedule over
+optimiser steps, and that is what we implement. This is consistent with their M3
+optimiser (\S7.2), which applies the same idea to momentum across optimiser
+steps, and with \S7.3's proposal to initialise CMS blocks from pre-trained MLP
+weights. The paper also gestures at a within-sequence reading; the two are not
+equivalent and we took the unambiguous one.
+
+\item \textbf{Causality in Eq.~90.} The retrieval memory is indexed
+$C\lceil t/C\rceil$, which is not causal for $t$ inside a chunk. We use the
+chunk start.
+
+\item \textbf{Memory-norm projection.} Written exactly as Eq.~88 the recurrence
+diverges---measured here, the memory norm reaches $10^{10}$ by step 80 and
+overflows by step 96. The mechanism is a property of self-modification rather
+than an implementation error: expanding the update, the generated target
+$\hat v=\mathcal{M}_{\mathrm{ref}}(v)$ is itself a function of the memory and
+$v$ is in turn $\mathcal{M}_{\mathrm{ref}}(x)$, so the write term contains
+$+\eta\,\mathcal{M}_{\mathrm{ref}}\,v\,k^{\!\top}$, which is \emph{quadratic} in
+$\lVert M\rVert$. In the paper the memories are two-layer MLPs inside a
+normalised stack that absorbs this; the linear form has nothing to absorb it. We
+project each head's memory onto a Frobenius ball after each update, leaving the
+update rule exactly as Eq.~88. At the study's operating point the projection
+never engages ($\lVert M\rVert_F\!\approx\!2.5$ against a radius of $20$); it
+engages only on rollouts long enough for the divergence to appear, and the
+engagement rate is logged every epoch.
+
+Two less invasive-looking alternatives were tried first and are recorded because
+both are tempting and both are worse. Normalising the generated target $\hat v$
+stabilises the recurrence but destroys the magnitude of the quantity the update
+regresses on: measured, decision accuracy at corridor~32 fell from $1.000$ to
+chance while the training curve looked healthy for the first ${\sim}25$ epochs,
+so the damage was invisible early. Tying retention to the write rate
+($\alpha\le1-\eta$) is harmless but pointless---the learned $\alpha$ settles near
+$0.77$ either way, so the constraint never binds.
+
+\item \textbf{Scale.} Everything here is three orders of magnitude smaller than
+\cite{behrouz2025nested}. Their claims are about language models; ours are about
+a $300$\,k-parameter memory inside a world model. Nothing in this report should
+be read as a reproduction of their results.
+\end{enumerate}
+
+% =====================================================================
+\section{Benchmarks}
+\label{sec:bench}
+
+\subsection{Environments}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Environment & Tests & Role \\
+\midrule
+\code{TMaze-v0}          & retention of one cue across a tunable delay & primary \\
+\code{SequenceRecall-v0} & holding $k$ associations at once            & capacity axis \\
+\code{CarRacing-v0}      & the reference task of \cite{ha2018world}    & external comparability \\
+\bottomrule
+\end{tabular}
+\caption{Environments. All emit $64\times64\times3$ uint8 frames.}
+\end{table}
+
+The two synthetic environments are pure NumPy---no gymnasium, Box2D or
+pygame---so they install instantly and are bit-reproducible. Three properties
+make them suitable for a world-model study specifically.
+
+\emph{The memory requirement lands inside the world-model loss, not only in the
+reward.} In \code{TMaze-v0} a coloured cue appears at $t=0$, a corridor of
+tunable length follows with visually salient but uninformative distractors, the
+agent chooses at a junction, and the next frame reveals whether it was right.
+Predicting that one frame requires both the cue (seen at $t=0$) and the action
+(taken now); nothing in the current frame reveals it. The environment tags that
+transition \code{memory\_critical} and the benchmark reports likelihood
+restricted to exactly those steps.
+
+\emph{Ground-truth latent variables are emitted in \code{info}.} The cue, the
+correct action and the delay since the cue are exposed to the evaluation code and
+never to the model, which makes retention curves exact rather than inferred.
+
+\emph{The environment is verified as a memory task rather than assumed to be
+one.} A unit test confirms an agent given the cue scores $40/40$ while a
+cue-blind agent is at chance.
+
+Corridor length is the study's independent variable: it is the required memory
+horizon, and it can be swept in minutes.
+
+\subsection{Metrics}
+
+\begin{description}[leftmargin=*,style=nextline]
+\item[Decision accuracy (headline).] At the memory-critical transition, we take
+the model's predicted next latent, assign it to the nearer of the two
+ground-truth outcome centroids, and compare with the truth. Chance is exactly
+$0.5$, and---crucially---it cannot be gamed by hedging: a model that predicts the
+average of the two outcomes lands between the centroids and scores at chance.
+Hedging is precisely the likelihood-optimal strategy for a model that has not
+learned the rule, which is why likelihood alone is the wrong instrument.
+
+\item[Teacher-forced NLL.] Equation~\ref{eq:mdn} over all steps, and separately
+restricted to memory-critical steps.
+
+\item[Open-loop imagination.] Warm the state on ground truth, then roll forward
+feeding the model its own predictions with the true action sequence. Error at
+small $k$ measures local dynamics; the slope measures whether the state retains
+enough to stay on the true trajectory.
+
+\item[Retention probes.] Harvest the recurrent features $h_t$, and for each
+cue-to-probe delay $d$ fit a \emph{linear} ridge classifier from $h_t$ to the
+ground-truth cue, splitting \emph{by episode}. Reported alongside is the control:
+the same probe on $z_t$ alone. Linear probes rather than MLPs, because a
+nonlinear probe can manufacture accuracy from a state no linear controller could
+use, and $C$ here \emph{is} linear.
+
+\item[Continual learning.] Task-incremental protocol over environment variants
+that share pixel statistics and differ only in the cue$\rightarrow$outcome rule,
+with no replay and no task label, reported as backward and forward transfer in
+the style of Lopez-Paz and Ranzato \cite{lopezpaz2017gem}. Forgetting is only
+measurable against something learned, so the benchmark self-reports
+\code{informative: false} when mean accuracy on each task immediately after
+training it is near chance.
+
+\item[Control.] Real-environment return with the CMA-ES controller, plus the
+dream-transfer variant of \cite[\S5]{ha2018world} in which $C$ is trained
+entirely inside $M$'s imagination and only evaluated for real.
+
+\item[Cost.] Parameters, per-step inference latency, training-pass time,
+throughput and peak resident memory, on every run.
+\end{description}
+
+\subsection{Validating the instruments}
+
+Seven of the twenty-five tests in the repository exist to validate the
+measurement apparatus rather than the code:
+
+\begin{itemize}[leftmargin=*]
+\item the open-loop harness is checked against an \emph{analytic oracle}---a
+model that is exactly right must score zero error at every horizon, and a biased
+model must compound. This test caught a defect in which the first open-loop step
+was silently teacher-forced;
+\item decision accuracy is checked with both an oracle (must score $1.0$) and a
+hedger (must score chance);
+\item the probe is checked to find signal in a planted-signal dataset and to
+\emph{reject} it in pure noise, and to lose accuracy when the group split is
+honest, which pins the episode-level split;
+\item the MDN likelihood is checked against the closed-form Gaussian;
+\item every backbone must satisfy $\text{forward(sequence)} =
+\text{step-by-step}$ to $10^{-5}$. A core failing this trains normally,
+benchmarks normally on teacher-forced metrics, and is silently wrong in every
+open-loop, dream and control result.
+\end{itemize}
+
+\subsection{A property of the objective that the benchmark must correct for}
+\label{sec:findings-nll}
+
+A delayed-recall episode contains exactly one transition that cannot be predicted
+without memory---once the answer is revealed, memory is no longer needed. At
+sequence length $L$ that transition carries ${\sim}1/L$ of the loss, and the most
+a model can gain by getting it right is the entropy of the outcome: about $0.69$
+nats for a binary cue, against a per-step NLL of ${\sim}25$.
+
+The consequence is measurable. On \code{TMaze-v0} with corridor 6, sweeping the
+weight $\lambda$ applied to memory-critical transitions:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+$\lambda$ & Decision acc.\ (chance $0.5$) & NLL @ critical & NLL (all steps) & Probe at decision \\
+\midrule
+1   & $0.500$ & $25.53$ & $13.16$ & $0.44$ (chance) \\
+20  & $1.000$ & $19.42$ & $12.76$ & $1.00$ \\
+100 & $1.000$ & $13.68$ & $12.49$ & $1.00$ \\
+\bottomrule
+\end{tabular}
+\caption{LSTM core, 2000 rollouts, 60 epochs. At $\lambda=1$ the converged model
+predicts almost exactly the \emph{midpoint} of the two possible successors---mean
+distance to the midpoint $0.25$ against a centroid separation of $6.74$---while a
+probe shows the cue was held in the state four steps into the corridor and gone
+by the decision.}
+\label{tab:lambda}
+\end{table}
+
+The model is not failing to remember. It is correctly optimising an objective
+that barely rewards remembering, and spending its recurrent capacity on the many
+locally predictable corridor frames instead. Two things follow. First, this is
+worth reporting on its own: maximum-likelihood world-model training gives a
+recurrent core almost no incentive to retain task-critical information, and the
+incentive can be quantified. Second, the benchmark has no headroom at
+$\lambda=1$---every memory layer scores at chance and nothing can be
+distinguished---so the memory configurations use $\lambda=20$, applied
+identically to both arms and disclosed. Note that it also \emph{lowers}
+unweighted NLL, so it is a fix to an optimisation-priority pathology rather than
+a quality trade-off.
+
+% =====================================================================
+\section{Machine and software environment}
+\label{sec:env}
+
+Every result in this report was produced on a single machine.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+\multicolumn{2}{l}{\textbf{Hardware}}\\
+\midrule
+Chip                & Apple M4 \\
+CPU                 & 10 cores (4 performance, 6 efficiency) \\
+Unified memory      & 16\,GB ($17.18\times10^{9}$ bytes); ${\sim}10$\,GB usable in practice \\
+GPU backend         & Apple Metal (PyTorch MPS) \\
+\midrule
+\multicolumn{2}{l}{\textbf{Operating system}}\\
+\midrule
+macOS               & 27.0 (build 26A5388g), \code{macOS-27.0-arm64-arm-64bit} \\
+\midrule
+\multicolumn{2}{l}{\textbf{Software}}\\
+\midrule
+Python              & 3.12.12 (Homebrew; \emph{not} the system 3.14, which has no PyTorch wheels) \\
+PyTorch             & 2.13.0, MPS built and available \\
+NumPy               & 2.5.2 \\
+gymnasium / Box2D   & 1.3.0 / 2.3.10 (CarRacing only) \\
+cma                 & 4.4.4 \\
+matplotlib / Pillow / PyYAML & 3.11.1 / 12.3.0 / 6.0.3 \\
+\bottomrule
+\end{tabular}
+\caption{Execution environment. Recorded in every run's \code{bench.json} under
+\code{meta.device}, so a stale result can always be traced to the machine that
+produced it.}
+\end{table}
+
+\paragraph{Design decisions forced by the hardware.} The 10\,GB working budget
+is not incidental; it determines the architecture of the pipeline.
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Frames are memory-mapped.} The frame store is the only large object
+(${\sim}1$--$3$\,GB). Memory-mapping hands residency to the OS page cache, which
+is right for the VAE's uniform random access; decompressing shards into the heap
+is what pushes a laptop into swap.
+\item \textbf{Latents are precomputed once.} This turns $M$-training from a
+multi-gigabyte image problem into a ${\sim}30$\,MB vector problem, which is what
+makes many seeds and many sequence lengths affordable at all.
+\item \textbf{float32 throughout.} MPS mixed precision is unreliable for LSTM and
+for the custom kernels in the Titans recurrence, and a numerics change landing on
+only one arm would invalidate the comparison.
+\item \textbf{CMA-ES workers run on CPU, not MPS.} Six Metal contexts cost more
+in driver overhead and memory than they save for models this small, and it leaves
+the GPU free.
+\item \textbf{A resident-memory tripwire} aborts a run at 9.5\,GB with an
+actionable message rather than letting the machine thrash.
+\item \textbf{Data volumes were scaled down deliberately.} \cite{ha2018world} use
+10{,}000 rollouts of 1000 steps---about 123\,GB of $64\times64$ frames. We use
+$1200\times37$ for the primary configuration.
+\end{itemize}
+
+\paragraph{Measured cost.} Per-step and per-pass timings (batch 64, $L=37$):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Core & Backbone params & Training step & Inference step \\
+\midrule
+\code{lstm}    & $299{,}008$ & ${\sim}10$\,ms   & ${\sim}0.5$\,ms \\
+\code{gru}     & $224{,}256$ & ${\sim}16$\,ms   & ${\sim}0.9$\,ms \\
+\code{supreme} & $300{,}696$ & ${\sim}2000$\,ms & ${\sim}2.5$\,ms \\
+\bottomrule
+\end{tabular}
+\caption{\textsc{Hope}'s two-order-of-magnitude training cost is inherent to a
+per-timestep inner optimisation, not an artefact of a lazy implementation: the
+chunk-parallel dual form of \cite[\S8.2]{behrouz2025nested} was implemented and
+measured at $1.01\times$, $0.98\times$ and $1.05\times$ speedup at $L=37,69,250$
+and then removed, because the cost is the backward pass through the sequential
+recurrence rather than kernel launches. Both models see the same data for the
+same number of epochs at matched parameter counts, so wall-clock must not be read
+as ``spent more compute to learn more''.}
+\end{table}
+
+% =====================================================================
+\section{Experimental protocol}
+
+\begin{enumerate}[leftmargin=*]
+\item Collect rollouts with a temporally correlated random policy. The dataset
+directory is keyed by environment and collection settings, never by model, so
+both arms read the same bytes.
+\item Train $V$; freeze it; precompute $\mu,\log\sigma^2$ for every frame. The
+sequence dataset resamples $z\sim\mathcal{N}(\mu,\sigma)$ each epoch, the
+regularisation \cite{ha2018world} rely on.
+\item Train $M$. Identical optimiser (Adam, cosine schedule), learning rate,
+epochs, gradient clipping, batch size and seeds across arms; only the backbone
+differs.
+\item Train $C$ with CMA-ES, evaluating all candidates in a generation on the
+same episode seeds (common random numbers).
+\item Run the benchmark suite, writing one \code{bench.json} per (model, seed).
+The reporting layer reads only those files, so any table can be regenerated
+without retraining.
+\end{enumerate}
+
+\paragraph{A constraint that silently invalidates the study if violated.} A
+training window must span cue$\rightarrow$decision. If \code{sequence\_length} is
+shorter than that span, then no window contains both: windows starting at the cue
+stop before the decision, and windows reaching the decision start after the cue.
+The dependency is then absent from the training signal entirely and every memory
+layer scores at chance for reasons unrelated to memory. Our first configurations
+had exactly this defect. A guard now reads the collected data and aborts any run
+that violates it.
+
+% =====================================================================
+\section{Results}
+\label{sec:results}
+
+All tables in this section are generated directly from the run artefacts by
+\code{scripts/make\_tables.py} and pulled in with \code{\textbackslash input};
+no number here is typed by hand, so the document cannot drift from the data.
+Each cell is mean $\pm$ standard error over seeds, with the seed count printed
+in the table so a single-seed entry is never mistaken for a converged one.
+Live coverage is tracked in \code{docs/status.md}.
+
+\IfFileExists{results_tables.tex}{\input{results_tables.tex}}{%
+\todo{results\_tables.tex not found --- run
+\code{python scripts/make\_tables.py} in the repository.}}
+
+\subsection{Average likelihood does not distinguish memory layers (final)}
+
+On \code{TMaze-v0} corridor 24, an LSTM core and a GRU core---identical in every
+other respect---reach one-step NLL of $12.87$ and $12.88$. Their effective memory
+horizons are $4$ and $12$ steps. A study reporting only world-model likelihood
+would have concluded that these two memory layers are the same.
+
+\subsection{The probe control behaves as it must (final)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccccccc}
+\toprule
+Delay since cue & 0 & 1 & 2 & 4 & 8 & 12 & 16 & 24 \\
+\midrule
+GRU, state              & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 0.80 & 0.48 & 0.48 \\
+LSTM, state             & 1.00 & 1.00 & 1.00 & 0.68 & 0.48 & 0.48 & 0.48 & 0.48 \\
+Observation control     & 1.00 & 0.48 & 0.48 & 0.48 & 0.44 & 0.48 & 0.48 & 0.48 \\
+\bottomrule
+\end{tabular}
+\caption{Linear probe accuracy, \code{TMaze-v0} corridor 24. The control is at
+$1.00$ while the cue is on screen and at chance from the very next step, which is
+the sanity condition for the whole suite: anything above it is memory and nothing
+else.}
+\end{table}
+
+\subsection{Retention and exploitation are separate milestones (final)}
+
+At corridor 32 with a 60-epoch budget, \textsc{Hope} already \emph{held} the cue
+(probe accuracy $0.867$ at delay 32, against $0.444$ for GRU and $0.311$ for
+LSTM) but had not yet learned to \emph{use} it---all three models were at chance
+on decision accuracy. The capability appears in the state well before it appears
+in behaviour. A study stopping at the earlier budget would have reported ``no
+difference in task performance'' while the mechanism was already in place. This
+is a concrete methodological warning for anyone benchmarking memory layers, and
+it is why both budgets are reported.
+
+\subsection{Headline: a horizon neither recurrent core reaches}
+\label{sec:headline}
+
+Table~\ref{tab:headline} is the main result and Table~\ref{tab:retention} is the
+mechanism behind it. At a 32-step required memory horizon, with matched parameter
+counts and every other component shared, \textsc{Hope} reaches decision accuracy
+$1.000\pm0.000$ while the MDN-RNN baseline ($0.475\pm0.047$) and the GRU control
+($0.483\pm0.006$) both sit at chance. Likelihood on the memory-critical
+transition separates by roughly ten nats---$15.61\pm0.97$ against $25.55\pm2.15$
+and $25.30\pm2.34$---and the controller trained on \textsc{Hope}'s state solves
+the maze outright (return $1.000$) where the controls do not.
+
+The retention curve says why. The observation-only control is at ceiling while
+the cue is on screen and at chance from the very next step, which is the sanity
+condition for the whole suite: any value above it is memory and nothing else.
+Against that baseline the cores separate cleanly---the LSTM's state has lost the
+cue by delay~8 ($0.43$), the GRU's holds to delay~8 and decays to $0.53$ by
+delay~32, and \textsc{Hope}'s is still at $0.98$ at delay~32. Effective memory
+horizons of $4$, $20$ and $32$ steps.
+
+Both \textsc{Hope} seeds agree \emph{exactly}---decision accuracy $1.000$ and
+probe accuracy $0.978$ at delay~32 in both---which for a metric this close to a
+step function is the reassuring outcome. And the advantage does \emph{not} appear
+in average one-step NLL ($13.68\pm2.16$ against $14.08\pm1.99$ and
+$14.12\pm1.97$, thoroughly overlapping): \S\ref{sec:findings-nll} restated with
+final numbers, and the reason this study does not report likelihood alone.
+
+\subsection{Ablation: the Continuum Memory System contributes nothing here}
+\label{sec:ablation}
+
+The ablation columns of Table~\ref{tab:headline} are more informative than the
+headline, and they cut against the obvious reading of it.
+
+\paragraph{CMS is inert.} \code{supreme-cms} is the \emph{baseline} LSTM with the
+Continuum Memory System attached---25\% more parameters than the baseline---and
+it lands exactly where the baseline landed: decision accuracy $0.483\pm0.017$
+against $0.475\pm0.047$, memory horizon $4$ against $4$, memory-critical NLL
+$25.49$ against $25.55$, probe AUC $0.699$ against $0.703$. Every one of those
+differences is inside the seed noise. Whatever the multi-frequency knowledge
+store does in the language-model regime it was designed for, at this scale and on
+this task it does not contribute to retention at all.
+
+\paragraph{The sequence mixer is what matters---and two different mixers both
+work.} \code{hope-attention}, the paper's own variant with softmax attention in
+place of the self-modifying Titans block, also reaches decision accuracy
+$1.000\pm0.000$ and horizon $32$, with the best probe AUC of any core ($0.969$).
+So the honest claim is narrower than ``self-modification is what remembers'':
+\emph{the MDN-RNN's recurrent core is the bottleneck, and either a self-modifying
+associative memory or attention removes it.} We cannot claim from these data that
+self-modification is uniquely necessary.
+
+\paragraph{But retention and imagination come apart, and that is the interesting
+result.} \code{hope-attention} remembers essentially perfectly and yet imagines
+badly: open-loop MSE at step~16 of $44.59\pm0.33$ against \textsc{Hope}'s
+$0.506\pm0.17$, and a drift slope of $+0.126\pm0.002$ against \textsc{Hope}'s
+$-0.070\pm0.013$---the only core in the study whose imagined trajectory diverges
+rather than stays bounded. Attention caches every past frame and can always
+retrieve the cue, but it does not learn dynamics that survive being fed their own
+output. \textsc{Hope} does both, at a fixed-size state rather than one that grows
+with the episode.
+
+For a \emph{world} model that dissociation is the substantive finding. Retention
+is necessary but not sufficient: the memory has to support rollout, and the
+strongest retention baseline available is the worst open-loop predictor here.
+
+\subsection{CarRacing: the external reference environment}
+
+\code{CarRacing-v0} is the one environment we did not design, which is why it
+matters for construct validity whatever it shows. What it shows is that it does
+not discriminate: the task is close to fully observable from a single frame, so a
+memory layer has little to do. One-step NLL across the four cores spans $10.19$
+(attention) to $11.13$ (GRU), with \textsc{Hope} at $10.36$ and the MDN-RNN at
+$10.87$---a range narrower than the seed-to-seed spread on \code{TMaze-v0}.
+\textsc{Hope} has the best one-step reconstruction error ($0.873$ against
+$1.085$--$1.118$) and the LSTM the best open-loop error at horizon~10; no
+ordering is consistent across metrics.
+
+We report this as a negative control, not as evidence for either model. All four
+cores land within a nat of one another here while separating by ten nats on the
+memory-critical transition of \code{TMaze-v0}: the discriminating power of the
+synthetic suite is a property of the suite, not an artefact of the models.
+
+\subsection{What these tables do not settle}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Two seeds, not three.} With a near-bimodal metric, two seeds
+agreeing exactly is encouraging but is not a distribution.
+\item \textbf{One \textsc{Hope} run is short.} Seed~1's memory training was
+interrupted at epoch~60 of~150. Its best-validation checkpoint was already past
+the phase transition and reaches the same decision and probe accuracy as seed~0,
+so it is reported---but the two seeds do not share a training budget and the
+error bar on \textsc{Hope}'s NLL mixes two training lengths.
+\item \textbf{\textsc{Hope}'s return is a single seed} (seed~0 only); no error bar.
+\item \textbf{\code{supreme-titans} was not run.} Titans without CMS is
+implemented and registered but never executed---at 55 minutes per seed it was cut
+for time. Since CMS is demonstrably inert (above), we expect it to match
+\textsc{Hope}, which would complete the $2\times2$ and upgrade ``CMS adds
+nothing'' from an inference to a measurement. Until then that cell is empty.
+\item \textbf{CarRacing ran at half scale} (150 rollouts, 12 memory epochs, no
+controller).
+\item \textbf{Three programme stages are outstanding:} the capacity axis
+(\code{SequenceRecall-v0}), the task-incremental protocol, and the corridor
+sweep---the last being what turns the choice of corridor~32 from a selected
+operating point into a curve whose crossover is itself the finding.
+\end{itemize}
+
+% =====================================================================
+\section{Threats to validity}
+
+Stated plainly, because these are what a reader should press on.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{The primary environment was built for this study.} A benchmark
+designed alongside the model it evaluates is a construct-validity risk. The
+independent checks---\code{SequenceRecall-v0} and especially
+\code{CarRacing-v0}---are the mitigation.
+\item \textbf{Operating-point selection.} Corridor 32 was chosen after observing
+that corridor 16 saturates, with three of five cores at ceiling. Presented alone
+this is post-hoc; presented as a sweep in which the crossover is the finding, it
+is not. The corridor sweep is the mitigation and it is part of the programme.
+\item \textbf{The headline requires $\lambda=20$.} Justified and measured
+(\S\ref{sec:findings-nll}) and applied identically to both arms, but it is a
+degree of freedom, and the $\lambda=1$ ablation must be reported at the operating
+point rather than only at corridor 6.
+\item \textbf{Decision accuracy is close to a step function.} A model either
+learns the cue$\rightarrow$outcome rule or it does not, so per-seed values cluster
+near $0.5$ or near $1.0$. The right summary is the mean \emph{and} the number of
+seeds that learned the rule; a mean alone is misleading. Here both \textsc{Hope}
+seeds learned it and none of the four control seeds did, which is the cleanest
+form the statistic can take at $n=2$---but it is still $n=2$.
+
+\item \textbf{The ablations are missing, and they carry the sharper claim.}
+\textsc{Hope} is a composition of two mechanisms. Showing that the composition
+beats an LSTM is a weaker result than showing which half is responsible, and the
+latter is what \code{supreme-titans} and \code{supreme-cms} were built to
+establish. They are implemented and unrun.
+\item \textbf{Under-training is indistinguishable from forgetting} on the
+decision metric, so budgets must be generous enough that the \emph{baseline} is
+not merely undertrained---otherwise a win for the challenger is meaningless.
+\item \textbf{Scale.} A $300$\,k-parameter memory on $64\times64$ synthetic
+frames. Nothing here transfers automatically to the language-model regime the
+nested-learning paper addresses.
+\end{enumerate}
+
+% =====================================================================
+\section{Reproduction}
+
+\begin{lstlisting}
+cd "World Model/World Model"
+./setup_env.sh && source .venv/bin/activate
+make test                                    # 25 correctness tests
+python wm.py study -c configs/tmaze_hard.yaml \
+       --backbones lstm,gru,attention,supreme
+python wm.py report runs
+\end{lstlisting}
+
+Each run writes \code{config.json}, \code{metrics.jsonl} and \code{bench.json};
+tables and figures are regenerated from those artefacts alone.
+
+% =====================================================================
+\begin{thebibliography}{9}
+\bibitem{ha2018world}
+D.~Ha and J.~Schmidhuber.
+\newblock World Models.
+\newblock \emph{arXiv:1803.10122}, 2018.
+
+\bibitem{behrouz2025nested}
+A.~Behrouz, M.~Razaviyayn, P.~Zhong, and V.~Mirrokni.
+\newblock Nested Learning: The Illusion of Deep Learning Architecture.
+\newblock \emph{Advances in Neural Information Processing Systems (NeurIPS)},
+2025. arXiv:2512.24695.
+
+\bibitem{hansen2006cma}
+N.~Hansen.
+\newblock The CMA Evolution Strategy: A Comparing Review.
+\newblock In \emph{Towards a New Evolutionary Computation}, 2006.
+
+\bibitem{lopezpaz2017gem}
+D.~Lopez-Paz and M.~Ranzato.
+\newblock Gradient Episodic Memory for Continual Learning.
+\newblock \emph{NeurIPS}, 2017.
+\end{thebibliography}
+
+\end{document}

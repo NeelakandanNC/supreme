@@ -1,0 +1,57 @@
+# Memory-horizon sweep, long end. Corridor 200 steps.
+# Use together with tmaze.yaml (corridor 64) and an intermediate run to produce
+# the "accuracy vs. required memory horizon" figure -- the plot that carries the
+# argument if the two models differ at all.
+_base_: base.yaml
+
+name: baseline
+env:
+  id: TMaze-v0
+  max_episode_steps: 69
+  kwargs:
+    corridor_length: 64
+    n_cues: 2
+    distractors: 3
+    cue_steps: 2
+    feedback_steps: 2
+
+data:
+  val_fraction: 0.15   # probes need one validation episode per (delay) sample
+  n_rollouts: 1000
+  steps_per_rollout: 69
+  sequence_length: 69          # MUST span cue -> decision; see check_window_spans_the_dependency()
+  eval_sequence_length: 69
+  frames_in_ram: 60000
+
+memory:
+  # Memory-critical transitions carry ~1/L of the world-model loss, and getting
+  # one right saves only the outcome entropy (~0.7 nats for a binary cue) out of
+  # a ~25-nat per-step NLL. Measured on this repo: at weight 1.0 a converged LSTM
+  # predicts the exact midpoint of the two possible successors and scores at
+  # chance, while a probe shows the cue *was* in the state earlier in the
+  # corridor -- the model is optimising correctly, the objective just does not
+  # reward remembering. Weight 20 restores headroom (decision accuracy 0.5 -> 1.0
+  # on a short corridor) and also *lowers* unweighted NLL, so it is not a
+  # quality trade-off. Applied identically to every backbone; report it.
+  critical_loss_weight: 20
+  # Measured: at corridor 16 the rule is still unlearned after 20 epochs and
+  # learned by ~50-100. Under-training looks exactly like forgetting on the
+  # decision metric, so the budget has to be generous enough that the BASELINE
+  # is not merely undertrained -- otherwise a win for Supreme is meaningless.
+  # Sequence training runs on precomputed 32-d latents, so epochs are cheap
+  # (a few seconds each); spend them.
+  epochs: 120
+  batch_size: 32
+
+controller:
+  # A memory episode yields a single +1/-1 outcome, so a candidate scored on 4
+  # episodes can only take 5 distinct fitness values -- far too coarse for CMA-ES
+  # to follow. Episodes here are short (tens of steps), so buying resolution with
+  # more of them is cheap and is the difference between the search working and not.
+  episodes_per_candidate: 16
+  generations: 60
+  population: 32
+
+bench:
+  horizons: [1, 2, 5, 10, 20, 50, 100, 135]
+  probe_delays: [0, 1, 4, 16, 32, 64, 100, 150, 200]

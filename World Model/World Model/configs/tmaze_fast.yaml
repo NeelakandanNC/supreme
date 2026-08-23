@@ -1,0 +1,49 @@
+# Smoke-test config: the full pipeline in a couple of minutes, for checking that
+# a new memory backbone runs end-to-end before committing to a real run.
+_base_: base.yaml
+
+name: smoke
+env:
+  id: TMaze-v0
+  max_episode_steps: 21
+  kwargs:
+    corridor_length: 16
+    n_cues: 2
+    distractors: 2
+    cue_steps: 2
+    feedback_steps: 2
+
+data:
+  val_fraction: 0.4   # probes need one validation episode per (delay) sample
+  n_rollouts: 64
+  steps_per_rollout: 21
+  sequence_length: 21          # MUST span cue -> decision; see check_window_spans_the_dependency()
+  eval_sequence_length: 21
+  frames_in_ram: 4000
+
+vision:
+  epochs: 2
+memory:
+  # Memory-critical transitions carry ~1/L of the world-model loss, and getting
+  # one right saves only the outcome entropy (~0.7 nats for a binary cue) out of
+  # a ~25-nat per-step NLL. Measured on this repo: at weight 1.0 a converged LSTM
+  # predicts the exact midpoint of the two possible successors and scores at
+  # chance, while a probe shows the cue *was* in the state earlier in the
+  # corridor -- the model is optimising correctly, the objective just does not
+  # reward remembering. Weight 20 restores headroom (decision accuracy 0.5 -> 1.0
+  # on a short corridor) and also *lowers* unweighted NLL, so it is not a
+  # quality trade-off. Applied identically to every backbone; report it.
+  critical_loss_weight: 20
+  epochs: 2
+  batch_size: 32
+  epochs: 2
+controller:
+  generations: 3
+  population: 8
+  episodes_per_candidate: 2
+  eval_episodes: 4
+  n_workers: 2
+
+bench:
+  horizons: [1, 2, 5, 10]
+  probe_delays: [0, 1, 2, 4, 8, 16]

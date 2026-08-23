@@ -1,0 +1,56 @@
+# CarRacing -- the reference environment from Ha & Schmidhuber (2018).
+#
+# Included for external comparability, NOT as the discriminating benchmark:
+# CarRacing is close to fully observable from a single frame, so a memory layer
+# has little to do there, and CMA-ES variance across seeds exceeds any plausible
+# effect. It matters because it is the one environment in this study that the
+# authors did not design.
+#
+# Scaled to half the frames and 12 M-epochs of the original plan. Measured cost
+# on the M4: collection ~1 min (6 workers), V ~6 min, M ~12 min for `supreme`
+# (0.73 s/step at B=16, L=64) and under a minute for the rest, benchmarks ~5 min.
+# The reduction is defensible precisely because this environment is a
+# comparability point rather than the basis of any claim -- but it IS a
+# reduction, and the write-up says so.
+#
+# Requires: pip install swig && pip install 'gymnasium[box2d]'   (verified)
+_base_: base.yaml
+
+name: baseline
+env:
+  id: CarRacing-v0
+  max_episode_steps: 250
+  action_repeat: 2
+
+data:
+  n_rollouts: 150
+  steps_per_rollout: 250
+  policy: random
+  sequence_length: 64          # no memory-critical step here, so short windows
+                               # are fine -- the BPTT-span guard applies only to
+                               # the recall environments
+  eval_sequence_length: 200
+  val_fraction: 0.15
+  frames_in_ram: 40000
+
+vision:
+  epochs: 10
+
+memory:
+  # No flagged memory-critical transition in this environment, so the weighting
+  # the recall environments need is off: reported as a standard world-model
+  # result, unmodified.
+  critical_loss_weight: 1.0
+  epochs: 12
+  batch_size: 16
+  temperature: 1.15
+
+controller:
+  generations: 25
+  population: 32
+  episodes_per_candidate: 3
+  eval_episodes: 12
+
+bench:
+  horizons: [1, 2, 5, 10, 20, 50, 100]
+  probe_delays: [1, 5, 10, 25, 50]
